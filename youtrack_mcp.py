@@ -10,6 +10,7 @@ from mcp.types import Tool
 YOUTRACK_URL = os.getenv("YOUTRACK_URL", "https://votre-instance.youtrack.cloud").rstrip("/")
 YOUTRACK_TOKEN = os.getenv("YOUTRACK_TOKEN")
 PROJECT_ID = os.getenv("PROJECT_ID", "0-1")
+KNOWLEDGE_BASE_ID = os.getenv("KNOWLEDGE_BASE_ID") or os.getenv("knowledge_base_id") or PROJECT_ID
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
 server = Server("youtrack-agent")
@@ -86,7 +87,7 @@ async def handle_list_tools():
         ),
         Tool(
             name="update_youtrack_story",
-            description="Met a jour une User Story existante et peut ajouter des sous-taches.",
+            description="Met a jour une User Story existante et peut ajouter des sous-taches. Permet aussi de changer le statut et l'assignation.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -107,8 +108,41 @@ async def handle_list_tools():
                         "items": {"type": "string"},
                         "description": "Liste de nouvelles sous-taches a ajouter",
                     },
+                    "status": {
+                        "type": "string",
+                        "description": "Nouveau statut de la User Story (ex: 'In Progress')",
+                    },
+                    "assignee": {
+                        "type": "string",
+                        "description": "Nom d'utilisateur ou email de l'assigné (ex: 'john.doe' ou 'john.doe@email.com')",
+                    },
                 },
                 "required": ["story_id"],
+            },
+        ),
+        Tool(
+            name="add_youtrack_documentation",
+            description="Cree un article dans la base de connaissances YouTrack (Knowledge Base). Necessite l'ID interne du projet YouTrack ayant la Knowledge Base activee (ex: '0-1').",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "doc_title": {"type": "string", "description": "Titre de la documentation"},
+                    "doc_content": {"type": "string", "description": "Contenu de la documentation (Markdown supporte)"},
+                    "knowledge_base_id": {"type": "string", "description": "ID interne du projet YouTrack avec Knowledge Base activee (ex: '0-1'). Recuperable via GET /api/projects?fields=id,shortName"},
+                    "parent_article_id": {"type": "string", "description": "ID de l'article parent (optionnel, ex: '62-3')", "nullable": True},
+                },
+                "required": ["doc_title", "doc_content", "knowledge_base_id"],
+            },
+        ),
+        Tool(
+            name="delete_youtrack_issue",
+            description="Supprime une issue YouTrack par son ID (ex: MSC-68).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "issue_id": {"type": "string", "description": "ID lisible de l'issue (ex: MSC-68)"},
+                },
+                "required": ["issue_id"],
             },
         ),
     ]
@@ -120,6 +154,36 @@ async def handle_call_tool(name: str, arguments: dict):
         return [{"type": "text", "text": "Erreur : YOUTRACK_TOKEN non configure."}]
 
     headers = _headers()
+
+    if name == "delete_youtrack_issue":
+        try:
+            print(f"[DEBUG] Called delete_youtrack_issue for: {arguments.get('issue_id')}")
+            issue_id = arguments["issue_id"]
+            # Get internal ID from readable ID
+            res = requests.get(
+                f"{YOUTRACK_URL}/api/issues/{issue_id}?fields=id,idReadable",
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if res.status_code == 404:
+                print(f"[DEBUG] Issue not found: {issue_id}")
+                return [{"type": "text", "text": f"Issue introuvable: {issue_id}"}]
+            res.raise_for_status()
+            internal_id = res.json().get("id")
+            del_res = requests.delete(
+                f"{YOUTRACK_URL}/api/issues/{internal_id}",
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if del_res.status_code in (200, 204):
+                print(f"[DEBUG] Issue {issue_id} deleted successfully.")
+                return [{"type": "text", "text": f"Issue {issue_id} supprimee."}]
+            else:
+                print(f"[DEBUG] Error deleting issue: {del_res.status_code} {del_res.text}")
+                return [{"type": "text", "text": f"Erreur suppression: {del_res.status_code} {del_res.text}"}]
+        except Exception as e:
+            print(f"[DEBUG] Exception in delete_youtrack_issue: {str(e)}")
+            return [{"type": "text", "text": f"Erreur API YouTrack (delete): {str(e)}"}]
 
     if name == "create_youtrack_story":
         try:
@@ -163,28 +227,86 @@ async def handle_call_tool(name: str, arguments: dict):
         except Exception as e:
             return [{"type": "text", "text": f"Erreur API YouTrack : {str(e)}"}]
 
+    if name == "add_youtrack_documentation":
+        try:
+            kb_id = arguments.get("knowledge_base_id") or KNOWLEDGE_BASE_ID
+            if not kb_id:
+                print(f"[DEBUG] add_youtrack_documentation: missing knowledge_base_id and PROJECT_ID not set")
+                return [{"type": "text", "text": "Erreur : knowledge_base_id requis (ID interne du projet YouTrack, ex: '0-1')."}]
+
+            print(f"[DEBUG] add_youtrack_documentation: using knowledge_base_id={kb_id}")
+
+            payload_kb = {
+                "summary": arguments["doc_title"],
+                "content": arguments["doc_content"],
+                "project": {"id": kb_id},
+            }
+            parent_article_id = arguments.get("parent_article_id")
+            if parent_article_id:
+                payload_kb["parent"] = {"id": parent_article_id}
+
+            print(f"[DEBUG] add_youtrack_documentation: payload_kb={payload_kb}")
+            res_kb = requests.post(
+                f"{YOUTRACK_URL}/api/articles?fields=id,summary,project(id,shortName),parent(id)",
+                headers=headers,
+                json=payload_kb,
+                timeout=REQUEST_TIMEOUT,
+            )
+            res_kb.raise_for_status()
+            kb_data = res_kb.json()
+            article_id = kb_data.get("id")
+            article_title = kb_data.get("summary")
+            print(f"[DEBUG] add_youtrack_documentation: created article_id={article_id}, title={article_title}")
+            return [
+                {
+                    "type": "text",
+                    "text": f"Article KB '{article_title}' cree (ID: {article_id})!",
+                }
+            ]
+        except Exception as e:
+            print(f"[DEBUG] Exception in add_youtrack_documentation: {str(e)}")
+            return [{"type": "text", "text": f"Erreur API YouTrack KB : {str(e)}"}]
 
     if name == "update_youtrack_story":
+
         try:
             story_id = arguments["story_id"]
             story_title = arguments.get("story_title")
             story_description = arguments.get("story_description")
             tasks = arguments.get("tasks", [])
             tasks_mode = arguments.get("tasks_mode", "add")
+            status = arguments.get("status")
+            assignee = arguments.get("assignee")
 
-            if not story_title and not story_description and not tasks:
+            if not (story_title or story_description or tasks or status or assignee):
                 return [
                     {
                         "type": "text",
-                        "text": "Aucune modification demandee. Fournissez story_title, story_description ou tasks.",
+                        "text": "Aucune modification demandee. Fournissez story_title, story_description, status, assignee ou tasks.",
                     }
                 ]
 
             payload_update = {}
+            custom_fields = []
             if story_title:
                 payload_update["summary"] = story_title
             if story_description:
                 payload_update["description"] = story_description
+            if status:
+                custom_fields.append({
+                    "name": "State",
+                    "$type": "SingleEnumIssueCustomField",
+                    "value": {"name": status}
+                })
+            if assignee:
+                custom_fields.append({
+                    "name": "Assignee",
+                    "$type": "SingleUserIssueCustomField",
+                    "value": {"login": assignee}
+                })
+            # Always send payload_update if any custom_fields or summary/description is present
+            if custom_fields:
+                payload_update["customFields"] = custom_fields
 
             # Fetch story info and current subtasks
             story_res = requests.get(
@@ -200,18 +322,26 @@ async def handle_call_tool(name: str, arguments: dict):
             s_internal_id = story_data.get("id")
             s_readable_id = story_data.get("idReadable", story_id)
 
-            # Update title/description if needed
-            if payload_update:
-                update_res = requests.post(
-                    f"{YOUTRACK_URL}/api/issues/{s_internal_id}?fields=id,idReadable,summary",
-                    headers=headers,
-                    json=payload_update,
-                    timeout=REQUEST_TIMEOUT,
-                )
-                update_res.raise_for_status()
-                story_data = update_res.json()
-                s_internal_id = story_data.get("id", s_internal_id)
-                s_readable_id = story_data.get("idReadable", s_readable_id)
+            # Update title/description/status/assignee if needed
+            if story_title or story_description or status or assignee or tasks:
+                if payload_update:
+                    update_res = requests.post(
+                        f"{YOUTRACK_URL}/api/issues/{s_internal_id}?fields=id,idReadable,summary,customFields(name,value(login,name))",
+                        headers=headers,
+                        json=payload_update,
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    response_text = update_res.text
+                    if update_res.status_code not in (200, 201):
+                        return [{
+                            "type": "text",
+                            "text": f"Erreur API YouTrack : {update_res.status_code} {response_text}"
+                        }]
+                    # Always show the response for debugging
+                    return [{
+                        "type": "text",
+                        "text": f"Réponse YouTrack : {response_text}"
+                    }]
 
             # Subtask management
             created_tasks = []
